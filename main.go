@@ -12,17 +12,21 @@ import (
 	"strings"
 )
 
+type IPC string
+
 type Workspace struct {
 	ID        int `json:"id"`
 	MonitorID int `json:"monitorID"`
 	Windows   int `json:"windows"`
-
-	w int
-	m int
+	i         int
 }
 
 func main() {
-	defer exit()
+	defer func() {
+		if e := recover(); e != nil {
+			fmt.Fprintln(os.Stderr, e)
+		}
+	}()
 
 	var disp []string
 	var prev bool
@@ -51,95 +55,81 @@ func main() {
 		disp = []string{"workspace @"}
 	}
 
+	ipc := IPC(fmt.Sprintf("%s/hypr/%s/.socket.sock",
+		os.Getenv("XDG_RUNTIME_DIR"),
+		os.Getenv("HYPRLAND_INSTANCE_SIGNATURE"),
+	))
+
 	var active Workspace
 	var workspaces []Workspace
-	info := ipc("j/activeworkspace", "j/workspaces")
+	info := ipc.Call("j/activeworkspace", "j/workspaces")
 	check(json.Unmarshal(info[0], &active))
 	check(json.Unmarshal(info[1], &workspaces))
 	slices.SortFunc(workspaces, func(a, b Workspace) int { return a.ID - b.ID })
 
 	var monitor []Workspace
 	for i, ws := range workspaces {
-		ws.w = i
+		ws.i = i
 		if ws.MonitorID == active.MonitorID {
-			ws.m = len(monitor)
+			if ws.ID == active.ID {
+				active.i = len(monitor)
+			}
 			monitor = append(monitor, ws)
-		}
-		if ws.ID == active.ID {
-			active.w = ws.w
-			active.m = ws.m
 		}
 	}
 
 	id := max(1, min(math.MaxInt32, func() int {
 		if prev {
-			if active.m == 0 || free > 0 {
+			if active.i == 0 || free > 0 {
 				tgt := monitor[0]
 				if free < 0 || tgt.Windows == 0 {
 					return tgt.ID
 				}
-				for tgt.w >= 0 && workspaces[tgt.w].ID == tgt.ID {
-					tgt.w--
+				for tgt.i >= 0 && workspaces[tgt.i].ID == tgt.ID {
+					tgt.i--
 					tgt.ID--
 				}
 				return tgt.ID
 			}
-			return monitor[active.m-1].ID
+			return monitor[active.i-1].ID
 		} else {
-			if active.m == len(monitor)-1 || free > 0 {
+			if active.i == len(monitor)-1 || free > 0 {
 				tgt := monitor[len(monitor)-1]
 				if free < 0 || tgt.Windows == 0 {
 					return tgt.ID
 				}
-				for tgt.w < len(workspaces) && workspaces[tgt.w].ID == tgt.ID {
-					tgt.w++
+				for tgt.i < len(workspaces) && workspaces[tgt.i].ID == tgt.ID {
+					tgt.i++
 					tgt.ID++
 				}
 				return tgt.ID
 			}
-			return monitor[active.m+1].ID
+			return monitor[active.i+1].ID
 		}
 	}()))
 
 	for i, d := range disp {
-		if strings.IndexByte(d, '@') < 0 {
-			disp[i] = "/dispatch " + d
-		} else {
-			d = strings.Replace(d, "@", "%d", 1)
-			disp[i] = fmt.Sprintf("/dispatch "+d, id)
-		}
+		d = strings.Replace(d, "@", fmt.Sprint(id), -1)
+		disp[i] = "/dispatch " + strings.TrimSpace(d)
 	}
-	for _, res := range ipc(disp...) {
+	for _, res := range ipc.Call(disp...) {
 		if string(res) != "ok" {
 			fmt.Fprintln(os.Stderr, string(res))
 		}
 	}
 }
 
-func ipc(cmds ...string) [][]byte {
-	conn := must(net.DialUnix("unix", nil, &net.UnixAddr{
-		Name: fmt.Sprintf("%s/hypr/%s/.socket.sock",
-			os.Getenv("XDG_RUNTIME_DIR"),
-			os.Getenv("HYPRLAND_INSTANCE_SIGNATURE"),
-		),
-	}))
+func (ipc IPC) Call(cmds ...string) [][]byte {
+	conn := must(net.DialUnix("unix", nil, &net.UnixAddr{Name: string(ipc)}))
 	defer func() { check(conn.Close()) }()
 
-	var cmd string
-	if len(cmds) == 1 {
-		cmd = cmds[0]
-	} else {
+	cmd := cmds[0]
+	if len(cmds) > 1 {
 		cmd = "[[BATCH]]" + strings.Join(cmds, ";")
 	}
 
 	io.WriteString(conn, cmd)
 	return bytes.Split(must(io.ReadAll(conn)), []byte{'\n', '\n', '\n'})
-}
-
-func exit() {
-	if e := recover(); e != nil {
-		fmt.Fprintln(os.Stderr, e)
-	}
 }
 
 func check(e error) {
